@@ -1,0 +1,4 @@
+.build/
+.swiftpm/
+Examples/*/.build/
+Examples/*/.swiftpm/

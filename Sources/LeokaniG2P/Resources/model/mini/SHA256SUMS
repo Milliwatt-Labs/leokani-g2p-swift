@@ -1,0 +1,4 @@
+ad3fe089e709acaac276fdc7fe0a18041cfc28d6633b51f8e6bab6dbbcf0d733  leokani-g2p.json.gz
+0a44b762b29dca3d9b8150b2f70076fae0d51a09ccdbb4ddc4ef032aec0829bc  oov-encoder.onnx
+2564e89e9aadbd3932d9e4fe1d3652a6dfa0f68dc84e10d88504f2c4a9d1733a  oov-decoder.onnx
+283f1122bbcb8cc577c568d2b52e1a2e205c286cae528f0b7b9e3b9492c91409  context.onnx
