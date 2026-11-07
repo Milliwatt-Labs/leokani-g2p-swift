@@ -11,11 +11,15 @@ fix="$here/Tests/LeokaniG2PTests/Fixtures"
 mkdir -p "$dst/mini" "$fix"
 for v in micro mini; do
   if [ $v = micro ]; then s="$src" d="$dst" gold=goldens.json; else s="$src/$v" d="$dst/$v" gold=goldens-$v.json; fi
-  for f in leokani-g2p.json.gz oov-encoder.onnx oov-decoder.onnx context.onnx; do
+  # 1.3+: the two .data lexicon files; 1.2: leokani-g2p.json.gz
+  if [ -f "$s/leokani-g2p.data" ]; then files="leokani-g2p.data leokani-g2p-words.data"; else files="leokani-g2p.json.gz"; fi
+  files="$files oov-encoder.onnx oov-decoder.onnx context.onnx"
+  rm -f "$d/leokani-g2p.json.gz" "$d/leokani-g2p.data" "$d/leokani-g2p-words.data"
+  for f in $files; do
     cp "$s/$f" "$d/$f"
   done
   cp "$s/goldens.json" "$fix/$gold"
-  ( cd "$d" && shasum -a 256 leokani-g2p.json.gz oov-encoder.onnx oov-decoder.onnx context.onnx > SHA256SUMS )
+  ( cd "$d" && shasum -a 256 $files > SHA256SUMS )
   echo "== $v"; cat "$d/SHA256SUMS"
 done
 [ -f "$src/user-lexicon-goldens.json" ] && cp "$src/user-lexicon-goldens.json" "$fix/user-lexicon-goldens.json"

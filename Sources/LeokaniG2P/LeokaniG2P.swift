@@ -21,7 +21,7 @@ import Compression
 
 public final class LeokaniG2P: @unchecked Sendable {
     public static let format = "leokani-g2p/1"
-    public static let version = "1.2.0"
+    public static let version = "1.3.0"
 
     /// The model sizes. Both ship with the package: micro in model/, mini in model/mini/.
     public enum Variant: String, CaseIterable, Sendable {
@@ -44,7 +44,7 @@ public final class LeokaniG2P: @unchecked Sendable {
     /// the phoneme symbols the models produce (a custom pronunciation may use these, ˈ, ˌ and spaces)
     public let phonemeSymbols: [String]
 
-    let lexicon: [String: String]
+    let lexicon: Lexicon
     let cased: [String: String]
     let variants: [String: [String]]
     let wordIds: [String: Int]
@@ -54,8 +54,28 @@ public final class LeokaniG2P: @unchecked Sendable {
     let symbolWords: [String: String]
     let numbers: Numbers
     let normalizer: Normalizer
-    let oovModel: OOVModel
-    let context: ContextModel
+    private let directory: URL
+    private var _oov: OOVModel?
+    private var _context: ContextModel?
+    /// the letter-to-sound models (started on the first unknown word when lazy)
+    var oovModel: OOVModel {
+        if let m = _oov { return m }
+        do {
+            let m = try OOVModel(encoder: directory.appendingPathComponent("oov-encoder.onnx"),
+                                 decoder: directory.appendingPathComponent("oov-decoder.onnx"))
+            _oov = m
+            return m
+        } catch { fatalError("Leokani G2P: \(error)") }       // the files were there when the instance opened
+    }
+    /// the context model (started on the first piece when lazy)
+    var context: ContextModel {
+        if let m = _context { return m }
+        do {
+            let m = try ContextModel(url: directory.appendingPathComponent("context.onnx"))
+            _context = m
+            return m
+        } catch { fatalError("Leokani G2P: \(error)") }
+    }
     let maxOut: Int
     private var cache: [String: String] = [:]
     private let lock = NSRecursiveLock()
@@ -69,17 +89,30 @@ public final class LeokaniG2P: @unchecked Sendable {
     }
 
     /// - Parameters:
-    ///   - modelDirectory: a folder with leokani-g2p.json.gz (or leokani-g2p.json) and the three .onnx files;
-    ///     nil uses the files bundled with the package.
+    ///   - modelDirectory: a folder with the model files (1.3: leokani-g2p.data, leokani-g2p-words.data; 1.2:
+    ///     leokani-g2p.json.gz or leokani-g2p.json) and the three .onnx files; nil uses the files bundled with the
+    ///     package.
     ///   - variant: .micro (default) or .mini, looked up under modelDirectory (mini: its mini/ subfolder).
     ///   - userLexicon: custom pronunciations to start with (it stays live: entries added later apply too).
-    public init(modelDirectory: URL? = nil, variant: Variant = .micro, userLexicon: UserLexicon? = nil) throws {
+    ///   - compactLexicon: a leokani-g2p.lex (scripts/make_lex.py) for this variant: the document and the lexicon
+    ///     come from it, memory-mapped, instead of from leokani-g2p.json.gz (much less memory, much faster to open).
+    ///   - lazy: read the other-words file and start each model only when a piece first needs it (1.3 files;
+    ///     default false: everything now).
+    public init(modelDirectory: URL? = nil, variant: Variant = .micro, userLexicon: UserLexicon? = nil,
+                compactLexicon: URL? = nil, lazy: Bool = false) throws {
         guard let base = modelDirectory ?? LeokaniG2P.bundledModelDirectory else {
             throw UserLexiconError(message: "Leokani G2P: no model directory")
         }
         let dir = variant.directory(in: base)
         self.variant = variant
-        let doc = try LeokaniG2P.readDocument(dir)
+        var mapped: CompactLexicon?
+        var packed: DataLexicon?
+        if let compactLexicon {
+            mapped = try CompactLexicon(url: compactLexicon)
+        } else if FileManager.default.fileExists(atPath: dir.appendingPathComponent(DataLexicon.file).path) {
+            packed = try DataLexicon(directory: dir, lazy: lazy)
+        }
+        let doc = try mapped?.document ?? packed?.document ?? LeokaniG2P.readDocument(dir)
         guard doc["format"] as? String == LeokaniG2P.format else {
             throw UserLexiconError(message: "\(dir.path): not a \(LeokaniG2P.format) model")
         }
@@ -87,7 +120,7 @@ public final class LeokaniG2P: @unchecked Sendable {
             guard let v = doc[k] as? T else { throw UserLexiconError(message: "Leokani G2P: model file has no \(k)") }
             return v
         }
-        lexicon = try dict("lexicon")
+        if let mapped { lexicon = .mapped(mapped) } else if let packed { lexicon = .data(packed) } else { lexicon = .decoded(try dict("lexicon")) }
         cased = try dict("cased")
         variants = try dict("variants")
         let cw: [String] = try dict("contextWords")
@@ -112,12 +145,20 @@ public final class LeokaniG2P: @unchecked Sendable {
 
         let lex = lexicon, cs = cased, wi = ids, vars = variants
         numbers = Numbers(atoms, word: { w in cs[w] ?? lex[w.lower] })
-        normalizer = Normalizer(known: { lex[$0] != nil }, letters: letters, cased: { cs[$0] != nil },
+        normalizer = Normalizer(known: { lex.contains($0) }, letters: letters, cased: { cs[$0] != nil },
                                 common: { wi[$0] != nil },
                                 reading: { w in (lex[w].map { [$0] } ?? []) + (vars[w] ?? []) })
-        oovModel = try OOVModel(encoder: dir.appendingPathComponent("oov-encoder.onnx"),
+        directory = dir
+        if lazy {
+            for f in ["oov-encoder.onnx", "oov-decoder.onnx", "context.onnx"]
+            where !FileManager.default.fileExists(atPath: dir.appendingPathComponent(f).path) {
+                throw UserLexiconError(message: "Leokani G2P: no \(f) in \(dir.path)")
+            }
+        } else {
+            _oov = try OOVModel(encoder: dir.appendingPathComponent("oov-encoder.onnx"),
                                 decoder: dir.appendingPathComponent("oov-decoder.onnx"))
-        context = try ContextModel(url: dir.appendingPathComponent("context.onnx"))
+            _context = try ContextModel(url: dir.appendingPathComponent("context.onnx"))
+        }
 
         var allowed = Set<Unicode.Scalar>()
         for s in outSyms { allowed.formUnion(s.unicodeScalars) }
@@ -127,9 +168,20 @@ public final class LeokaniG2P: @unchecked Sendable {
         if let userLexicon { try ul.merge(userLexicon) }
         self.userLexicon = ul
         normalizer.user = ul
+        if case .data(let d) = lexicon { d.say = { [unowned self] w in self.oov([w])[0] } }
     }
 
     // MARK: - public API
+
+    /// Which parts are in memory: "words" (the other-words file) and the models ("enc", "dec", "ctx").
+    public func loaded() -> [String] {
+        lock.lock(); defer { lock.unlock() }
+        var out: [String] = []
+        if case .data(let d) = lexicon { if d.loaded { out.append("words") } } else { out.append("words") }
+        if _oov != nil { out += ["enc", "dec"] }
+        if _context != nil { out.append("ctx") }
+        return out
+    }
 
     /// A line or paragraph -> one Kokoro phoneme string (the clause chunks joined by a space).
     public func phonemize(_ text: String) -> String { phonemizeChunks(text).joined(separator: " ") }
@@ -218,7 +270,7 @@ public final class LeokaniG2P: @unchecked Sendable {
         let r = w.rstrip(".")
         if w.ends("."), !r.isEmpty, !r.has(".") { w = r }
         let lw = w.lower
-        return !w.has(PH) && cased[w] == nil && lexicon[lw] == nil && symbolWords[w] == nil && w.anyAlpha
+        return !w.has(PH) && cased[w] == nil && !lexicon.contains(lw) && symbolWords[w] == nil && w.anyAlpha
             && !(w.anyDigit && numbers.say(w) != nil)
     }
 
@@ -422,5 +474,21 @@ extension LeokaniG2P {
         #else
         throw UserLexiconError(message: "Leokani G2P: gunzip leokani-g2p.json.gz to leokani-g2p.json on this platform")
         #endif
+    }
+}
+
+// MARK: - chunks with their text
+
+extension LeokaniG2P {
+    /// One clause chunk: the (normalised, cleaned) text it came from and its phonemes.
+    public struct Chunk: Sendable, Equatable {
+        public let text: String
+        public let phonemes: String
+    }
+
+    /// phonemizeChunks with each chunk's text beside its phonemes (the same chunks, in order).
+    public func phonemizeDetailed(_ text: String) -> [Chunk] {
+        lock.lock(); defer { lock.unlock() }
+        return chunks(clean(normalizer(text))).map { Chunk(text: $0, phonemes: line($0)) }
     }
 }

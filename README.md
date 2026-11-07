@@ -7,8 +7,8 @@ Leokani-tts and Kokoro use. It contains no espeak-ng code or data files.
 
 This package is a pure-Swift port of the [Python package](https://github.com/Milliwatt-Labs/leokani-g2p). It
 reproduces every output in `goldens.json` exactly, has no dependencies beyond Apple's Accelerate framework, and
-ships the same model files inside the package, in two sizes: `.micro` (the default, about 19 MB) and `.mini`
-(about 22 MB, better on names and rare words).
+ships the same model files inside the package, in two sizes: `.micro` (the default, about 10 MB) and `.mini`
+(about 11 MB, better on names and rare words).
 
 ## Install
 
@@ -16,7 +16,7 @@ Swift Package Manager, iOS 16 / macOS 13 or newer:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/Milliwatt-Labs/leokani-g2p-swift", from: "1.2.0"),
+    .package(url: "https://github.com/Milliwatt-Labs/leokani-g2p-swift", from: "1.3.0"),
 ],
 targets: [
     .target(name: "MyApp", dependencies: [.product(name: "LeokaniG2P", package: "leokani-g2p-swift")]),
@@ -126,7 +126,7 @@ its goldens into the tests, and writes `SHA256SUMS`. Run the tests afterwards.
 ## License
 
 - Code (the `LeokaniG2P` library, the `leokani-g2p` tool, tests and examples): [MIT](LICENSE).
-- Model weights (`*.onnx`), the lexicon (`leokani-g2p.json.gz`) and the goldens: [CC BY 4.0](LICENSE-CC-BY-4.0.txt).
+- Model weights (`*.onnx`), the lexicon (`leokani-g2p.data`, `leokani-g2p-words.data`) and the goldens: [CC BY 4.0](LICENSE-CC-BY-4.0.txt).
 
 Credit it as: **Leokani G2P by Milliwatt Labs (milliwattlabs.com)**. The lexicon's word list includes words from the
 [CMU Pronouncing Dictionary](https://github.com/cmusphinx/cmudict) (BSD-2-Clause) and place names from

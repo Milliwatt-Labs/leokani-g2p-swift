@@ -3,6 +3,8 @@
 //
 // Reads the release .onnx files directly: the float32 initializers and, for each MatMul, which initializer it
 // multiplies by (the exporter names those "onnx::MatMul_NNN", so the node's output name says what the weight is).
+// 1.3's graphs store their weights as signed bytes times one scale per channel (Cast + Mul) or float16 (Cast): those are
+// expanded to float32 under the name the last node outputs, which is the 1.2 weight's name.
 // Only what Leokani G2P's three graphs need; not a general ONNX runtime.
 import Foundation
 
@@ -39,7 +41,7 @@ struct OnnxWeights {
 
     private mutating func graph(_ g0: PB) throws {
         var g = g0
-        var nodes: [(op: String, inputs: [String], outputs: [String])] = []
+        var nodes: [(op: String, inputs: [String], outputs: [String], axis: Int)] = []
         while let (f, wt) = try g.key() {
             switch (f, wt) {
             case (1, 2): nodes.append(try node(try g.sub()))
@@ -48,6 +50,22 @@ struct OnnxWeights {
                 tensors[name] = t
             default: try g.skip(wt)
             }
+        }
+        // weights stored small: expand them first, so the MatMuls below find them under their own names.
+        // 1.3: signed bytes or float16 -> Cast (read as float32 above), then bytes * per-channel scale -> Mul of two weights
+        var uses: [String: Int] = [:]
+        for n in nodes { for x in n.inputs { uses[x, default: 0] += 1 } }
+        for n in nodes where n.op == "Cast" || n.op == "Mul" {
+            guard let out = n.outputs.first, let a = tensors[n.inputs[0]], !a.data.isEmpty else { continue }
+            if n.op == "Cast" {
+                tensors[out] = a
+                if uses[n.inputs[0]] == 1 { tensors[n.inputs[0]] = nil }
+                continue
+            }
+            guard n.inputs.count == 2, let b = tensors[n.inputs[1]], !b.data.isEmpty,
+                  let m = broadcastMul(a, b) ?? broadcastMul(b, a) else { continue }
+            tensors[out] = m
+            for x in n.inputs where uses[x] == 1 { tensors[x] = nil }
         }
         for n in nodes where n.op == "MatMul" && n.inputs.count == 2 {
             guard let wt = tensors[n.inputs[1]], let out = n.outputs.first else { continue }
@@ -58,18 +76,57 @@ struct OnnxWeights {
         }
     }
 
-    private func node(_ n0: PB) throws -> (op: String, inputs: [String], outputs: [String]) {
+    /// a * b, b broadcast into a's shape (numpy rules, b's dims right-aligned); nil if it doesn't broadcast
+    private func broadcastMul(_ a: Tensor, _ b: Tensor) -> Tensor? {
+        let r = a.dims.count
+        guard b.dims.count <= r else { return nil }
+        let bd = [Int](repeating: 1, count: r - b.dims.count) + b.dims
+        for k in 0..<r where bd[k] != 1 && bd[k] != a.dims[k] { return nil }
+        var st = [Int](repeating: 0, count: r), acc = 1
+        for k in stride(from: r - 1, through: 0, by: -1) {
+            st[k] = bd[k] == 1 ? 0 : acc
+            acc *= bd[k]
+        }
+        var out = [Float](repeating: 0, count: a.data.count)
+        var idx = [Int](repeating: 0, count: r)
+        for i in 0..<a.data.count {
+            var j = 0
+            for k in 0..<r { j += idx[k] * st[k] }
+            out[i] = a.data[i] * b.data[j]
+            var k = r - 1
+            while k >= 0 {
+                idx[k] += 1
+                if idx[k] < a.dims[k] { break }
+                idx[k] = 0
+                k -= 1
+            }
+        }
+        return Tensor(dims: a.dims, data: out)
+    }
+
+    private func node(_ n0: PB) throws -> (op: String, inputs: [String], outputs: [String], axis: Int) {
         var n = n0
-        var op = "", ins: [String] = [], outs: [String] = []
+        var op = "", ins: [String] = [], outs: [String] = [], axis = 1
         while let (f, wt) = try n.key() {
             switch (f, wt) {
             case (1, 2): ins.append(try n.string())
             case (2, 2): outs.append(try n.string())
             case (4, 2): op = try n.string()
+            case (5, 2):                                       // an attribute: only an axis is read
+                var a = try n.sub()
+                var name = "", i = 0
+                while let (af, awt) = try a.key() {
+                    switch (af, awt) {
+                    case (1, 2): name = try a.string()
+                    case (3, 0): i = Int(Int64(bitPattern: try a.varint()))
+                    default: try a.skip(awt)
+                    }
+                }
+                if name == "axis" { axis = i }
             default: try n.skip(wt)
             }
         }
-        return (op, ins, outs)
+        return (op, ins, outs, axis)
     }
 
     private func tensor(_ t0: PB) throws -> (String, Tensor) {
@@ -77,6 +134,7 @@ struct OnnxWeights {
         var dims: [Int] = [], type = 0, name = ""
         var floats: [Float] = []
         var raw: PB?
+        var i32: [Int64]?
         while let (f, wt) = try t.key() {
             switch (f, wt) {
             case (1, 0): dims.append(Int(try t.varint()))
@@ -88,13 +146,25 @@ struct OnnxWeights {
                 let d = try t.sub()
                 floats = d.floats()
             case (4, 5): floats.append(try t.fixed32Float())
+            case (5, 0): i32 = (i32 ?? []) + [Int64(bitPattern: try t.varint())]
+            case (5, 2):
+                var d = try t.sub()
+                var v: [Int64] = []
+                while !d.atEnd { v.append(Int64(bitPattern: try d.varint())) }
+                i32 = (i32 ?? []) + v
             case (8, 2): name = try t.string()
             case (9, 2): raw = try t.sub()
             default: try t.skip(wt)
             }
         }
-        if type != 1 { return (name, Tensor(dims: dims, data: [])) }   // only float32 weights are used
-        if let raw { floats = raw.floats() }
+        switch type {
+        case 1: if let raw { floats = raw.floats() }
+        case 3:                                                  // signed bytes (1.3's weights, before their scale)
+            if let raw { floats = raw.signedBytes() } else if let i32 { floats = i32.map { Float(((Int($0) & 0xFF) ^ 0x80) - 0x80) } }
+        case 10:                                                 // float16 (Cast's input)
+            if let raw { floats = raw.halfs() } else if let i32 { floats = i32.map { halfToFloat(UInt16(truncatingIfNeeded: $0)) } }
+        default: return (name, Tensor(dims: dims, data: []))     // only float weights are used
+        }
         let n = dims.reduce(1, *)
         guard floats.count == n else { throw G2PError("model: tensor \(name) has \(floats.count) values, not \(n)") }
         return (name, Tensor(dims: dims, data: floats))
@@ -151,6 +221,12 @@ private struct PB {
         // ONNX raw data is little-endian, as every Apple and Android CPU is
         return out
     }
+    func signedBytes() -> [Float] {                       // two's complement bytes -> -128...127
+        (i..<end).map { Float((Int(p[$0]) ^ 0x80) - 0x80) }
+    }
+    func halfs() -> [Float] {
+        stride(from: i, to: end - 1, by: 2).map { halfToFloat(UInt16(p[$0]) | UInt16(p[$0 + 1]) << 8) }
+    }
     mutating func skip(_ wt: Int) throws {
         switch wt {
         case 0: _ = try varint()
@@ -161,4 +237,16 @@ private struct PB {
         }
         if i > end { throw G2PError("model: bad protobuf") }
     }
+}
+
+/// IEEE 754 binary16 -> Float (no Float16 type on every platform this builds for)
+func halfToFloat(_ h: UInt16) -> Float {
+    let sign = UInt32(h >> 15) << 31
+    let e = Int((h >> 10) & 0x1F), m = UInt32(h & 0x3FF)
+    if e == 0 {
+        if m == 0 { return Float(bitPattern: sign) }
+        return (sign != 0 ? -1 : 1) * Float(m) * 0x1p-24        // subnormal
+    }
+    if e == 31 { return Float(bitPattern: sign | 0x7F80_0000 | (m << 13)) }
+    return Float(bitPattern: sign | UInt32(e - 15 + 127) << 23 | (m << 13))
 }

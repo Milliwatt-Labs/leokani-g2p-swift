@@ -18,15 +18,15 @@ enum Shared {
 final class GoldensTests: XCTestCase {
     /// goldens.json: every 'normalized' and 'leokani' string, exactly (pieces through piece(), lines and edge
     /// through the whole front end).
-    func testGoldens() throws { try check(Shared.g2p, "goldens.json") }
+    func testGoldens() throws { try Self.check(Shared.g2p, "goldens.json") }
 
     /// goldens-mini.json on the mini variant.
     func testGoldensMini() throws {
         XCTAssertEqual(Shared.mini.variant, .mini)
-        try check(Shared.mini, "goldens-mini.json")
+        try Self.check(Shared.mini, "goldens-mini.json")
     }
 
-    private func check(_ g: LeokaniG2P, _ file: String) throws {
+    static func check(_ g: LeokaniG2P, _ file: String) throws {
         let doc = Shared.json(file)
         XCTAssertEqual(doc["format"] as? String, "leokani-g2p/1")
         var checks = 0
